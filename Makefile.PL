@@ -17,6 +17,7 @@ WriteMakefile(
         'POE'                   => 0,
         'Attribute::Handlers'   => 0.85,
         'Log::Fu'               => 0.25,
+        'Class::Struct'         => 0,
     },
     dist                => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
     clean               => { FILES => 'POE-Attributes-*' },

@@ -19,8 +19,9 @@ no_index:
     - inc
 requires:
   Attribute::Handlers: 0.85
+  Class::Struct: 0
   Constant::Generate: 0.03
   Log::Fu: 0.25
   POE: 0
   Test::More: 0
-version: 0.01
+version: 0.02

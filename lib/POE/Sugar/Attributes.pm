@@ -1,3 +1,53 @@
+package POE::Sugar::Attributes::SymInfo;
+use strict;
+use warnings;
+use Class::Struct;
+use Attribute::Handlers;
+
+struct (__PACKAGE__,
+    [
+        'flags'     => '$',
+        'coderef'   => '$',
+        '_name'      => '$',
+        'package'   => '$',
+        'events'    => '@',
+        'data'      => '*@'
+    ]);
+
+sub name {
+    my ($self,$pkg) = @_;
+    if($self->_name) {
+        return $self->_name;
+    }
+    
+    $pkg ||= $self->package;
+    my $glob = Attribute::Handlers::findsym($pkg, $self->coderef);
+    if(!$glob) {
+        warn("Can't find symbol for " . $self->coderef);
+        return;
+    }
+    my $symname = *$glob{NAME};
+    $self->_name($symname);
+    return $symname;
+}
+
+package POE::Sugar::Attributes::PkgInfo;
+use strict;
+use warnings;
+use Class::Struct;
+
+struct (__PACKAGE__,
+    [
+        'ctor' => '$',
+        'dtor' => '$',
+        'events' => '%',
+        'catcher' => '$',
+        'reaper' => '$',
+        'sigs' => '%',
+        'syms' => '%'
+    ]);
+
+
 package POE::Sugar::Attributes;
 use strict;
 use warnings;
@@ -5,7 +55,7 @@ use warnings;
 use POE;
 use POE::Session;
 
-our $VERSION = 0.01;
+our $VERSION = 0.02;
 
 use base qw(Exporter);
 use Log::Fu { level => "info" };
@@ -19,6 +69,7 @@ BEGIN {
 }
 
 use Attribute::Handlers;
+
 use Constant::Generate [qw(
     PA_EVENT
     PA_CTOR
@@ -27,12 +78,15 @@ use Constant::Generate [qw(
     PA_CATCHER
     PA_REAPER
     PA_SIGHANDLER
+    
+    PA_NAME_RESOLVE
 )], -type => 'bitfield',
     -start_at => 1;
 
 use Constant::Generate [qw(
     FLD_FLAGS
     FLD_DATA
+    FLD_CODE
 )];
 
 my %map_names;
@@ -66,9 +120,23 @@ $HKEY_SIGHANDLERS = __PACKAGE__ . "__HKEY_SIGHANDLERS__";
 );
 
 
+
+sub _get_infos {
+    my ($pkg,$cv) = @_;
+    my $pkginfo = ($pkgcache{$pkg} ||=
+        POE::Sugar::Attributes::PkgInfo->new());
+    my $syminfo = ($pkginfo->syms->{$cv+0} ||=
+        POE::Sugar::Attributes::SymInfo->new(
+            package => $pkg,
+            coderef => $cv)
+        );
+    
+    return ($pkginfo,$syminfo);
+}
+
 sub _poe_attr_handler :ATTR(CODE) {
-    my ($pkg,$symbol,$cv,$attr,$data) = @_;
-    $symbol = *{$symbol}{NAME};
+    my ($pkg,undef,$cv,$attr,$data) = @_;
+    
     my @opt_array;
     my %opt_hash;
     
@@ -80,46 +148,59 @@ sub _poe_attr_handler :ATTR(CODE) {
     }
     
     my $flag = $map_names{$attr};
+    die "No such attribute: $attr" unless defined $flag;
     
-    unless($flag) {
-        die("No such attribute: $attr");
+    my ($pkg_info,$sym_info) = _get_infos($pkg, $cv);
+    
+    $sym_info->flags( ($sym_info->flags || 0) | $flag );
+    
+    if($flag == PA_EVENT)
+    {
+        if(@opt_array) {
+            push @{$sym_info->events}, @opt_array;
+        } else {
+            push @{$sym_info->events}, \undef;
+        }
     }
     
-    my $pkg_info = ( $pkgcache{$pkg} ||= {} );
-    my $sym_info = ($pkg_info->{$symbol} ||= []);
-    $sym_info->[FLD_FLAGS] ||= 0;
-    $pkg_info->{$symbol}->[FLD_FLAGS] |= $flag;
-    
-    
-    
-    if($flag == PA_EVENT) {
-        if(!@opt_array) {
-            push @opt_array, $symbol;
-        }
-        push @{$sym_info->[FLD_DATA]->{$flag}}, @opt_array;
-    } elsif ($flag == PA_TIMER) {
+    elsif ($flag == PA_TIMER)
+    {
         my $interval = delete $opt_hash{Interval};
-        die("Timer must have interval ($symbol)") unless $interval;
+        die("Timer must have interval ()") unless $interval;
         my $evname = $opt_hash{Name};
-        $evname ||= $symbol;    
-        $sym_info->[FLD_DATA]->{$flag}->{$evname} = $interval
-    } elsif ($flag == PA_CTOR || $flag == PA_DTOR) {
-        #Do we have anything to do here?
-    } elsif ($flag == PA_CATCHER || $flag == PA_REAPER) {
-        my $symkey = $const2hkey{$flag};
-        
-        $sym_info = ($pkg_info->{$symkey} = []);
-        $sym_info->[FLD_DATA]->{$flag} = $symbol;
-        $sym_info->[FLD_FLAGS] = $flag;
-    } elsif ($flag == PA_SIGHANDLER) {
-        if(!@opt_array) {
-            die("Signal handlers must have signal names as their arguments");
-        }
-        my $sighash = ($pkg_info->{$HKEY_SIGHANDLERS}->[FLD_DATA] ||= {});
-        foreach my $sig (@opt_array) {
-            $sighash->{$sig} = $symbol;
-        }
+        $evname ||= \undef;
+        $sym_info->data->[PA_TIMER] = [ $evname, $interval ];
     }
+    
+    elsif ($flag == PA_CTOR || $flag == PA_DTOR)
+    {
+        if($flag == PA_CTOR) {
+            $pkg_info->ctor($sym_info);
+        }
+        elsif($flag == PA_DTOR) {
+           $pkg_info->dtor($sym_info); 
+        }
+        #Do we have anything to do here?
+    }
+    
+    
+    elsif ($flag == PA_CATCHER) {
+        $pkg_info->catcher($sym_info);
+    }
+    
+    elsif ($flag == PA_REAPER) {
+        $pkg_info->reaper($sym_info);
+    }
+    
+    elsif ($flag == PA_SIGHANDLER) {
+        if(!ref $data) {
+            push @opt_array, $data;
+        }
+        foreach my $signame (@opt_array) {
+            log_debug("Found signal $signame");
+            $pkg_info->sigs->{$signame} = $sym_info;
+        }
+    }    
 }
 
 sub Start    :ATTR(CODE) { goto &_poe_attr_handler }
@@ -141,53 +222,62 @@ sub _get_params {
     my @events;
     my @timers;
     
-    while (my ($sym,$sym_info) = each %$pkg_info) {
-        log_debug("Found $pkg", "$sym");
-        $sym = $pkg."::".$sym;
-        next unless defined $sym_info->[FLD_FLAGS]; #Pseudo-symbols
-        if($sym_info->[FLD_FLAGS] & PA_CTOR) {
-            $ctor = $sym;
-        } elsif ($sym_info->[FLD_FLAGS] & PA_DTOR) {
-            $dtor = $sym;
-        }
-        if($sym_info->[FLD_FLAGS] & PA_EVENT) {
-            foreach my $evname (@{ $sym_info->[FLD_DATA]->{PA_EVENT()} }) {
-                push @events, [$evname, $sym];
+    foreach my $sym_info (values %{$pkg_info->syms}) {
+        
+        my $symname = $sym_info->name();
+        $symname = $pkg ."::$symname";
+        
+        if($sym_info->flags & PA_EVENT) {
+            foreach my $evname (@{$sym_info->events}) {
+                if(ref $evname) {
+                    log_debug("Event is the symbol name itself.. converting");
+                    $evname = $sym_info->name();
+                }
+                push @events, [$evname, $symname ];
             }
         }
-        if($sym_info->[FLD_FLAGS] & PA_TIMER) {
-            my $h = $sym_info->[FLD_DATA]->{PA_TIMER()};
-            while (my ($tname,$interval) = each %$h) {
-                push @timers, [$tname, $sym, $interval];
+        
+        if($sym_info->flags & PA_TIMER) {
+            my ($evname,$interval) = @{$sym_info->data->[PA_TIMER] };
+            if(ref $evname) {
+                log_debug("Timer event name is the symbol itsef.. converting");
+                $evname = $sym_info->name();
             }
+            push @timers, [ $evname, $symname, $interval ];
+        }
+        
+        if($sym_info->flags & PA_CTOR) {
+            $ctor = $symname;
+        }
+        if($sym_info->flags & PA_DTOR) {
+            $dtor = $symname;
         }
     }
-        
+    
     my $params = {
         Events => \@events,
         Timers => \@timers,
         Ctor    => $ctor,
         Dtor    => $dtor
     };
+
     
     foreach (
-        [$HKEY_REAPER, PA_REAPER, 'Reaper'],
-        [$HKEY_CATCHER, PA_CATCHER, 'Catcher']
+        ['reaper', 'Reaper'],
+        ['catcher', 'Catcher']
     ) {
-        my ($ikey,$flag,$pkey) = @$_;
-        if($pkg_info->{$ikey}) {
-            my $evname = $pkg_info->{$ikey}->[FLD_DATA]->{$flag};
-            push @events, [ $evname, $pkg . "::$evname" ];
-            $params->{$pkey} = $evname;
+        my ($meth,$key) = @$_;
+        if(my $handler = $pkg_info->can($meth)->($pkg_info)) {
+            my $symname = $handler->name;
+            push @events, [ $symname, $pkg . "::$symname" ];
+            $params->{$key} = $symname;
         }
     }
     
-    if($pkg_info->{$HKEY_SIGHANDLERS}) {
-        while (my ($sig,$sym) =
-               each %{$pkg_info->{$HKEY_SIGHANDLERS}->[FLD_DATA]}) {
-            $params->{Signals}->{$sig} = $sym;
-            push @events, [$sym, $pkg . "::$sym"];
-        }
+    while (my ($signame,$sighandler) = each %{$pkg_info->sigs} ) {
+        my $symname = $sighandler->name();
+        push @events, [ $symname, $pkg ."::$symname" ] ;
+        $params->{Signals}->{$signame} = $symname;
     }
     
     return $params;
@@ -277,7 +367,7 @@ sub wire_current_session {
 
 sub wire_new_session {
     my $alias = shift;
-    if($alias eq __PACKAGE__) {
+    if( $alias && $alias eq __PACKAGE__) {
         $alias = shift;
     }
     
